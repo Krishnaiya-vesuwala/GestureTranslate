@@ -1,5 +1,6 @@
 import cv2
 import mediapipe as mp
+import numpy as np
 import os
 
 # Dataset Settings
@@ -7,6 +8,8 @@ import os
 LABEL = "A"                 # Change for each gesture
 IMG_SIZE = 224              # Final image size
 OFFSET = 40                 # Padding around hand
+WHITE_BG = True             # Set False to keep original background
+
 
 SAVE_PATH = os.path.join("dataset", LABEL)
 os.makedirs(SAVE_PATH, exist_ok=True)
@@ -34,6 +37,64 @@ print("Press 'S' to save image")
 print("Press 'Q' to quit")
 print("==============================\n")
 
+
+def make_white_background(crop, landmarks_px, crop_x1, crop_y1, side, img_size):
+    """
+    Build a white background using MediaPipe's actual hand
+    structure: draw the finger 'bones' (HAND_CONNECTIONS) as
+    thick lines, round the joints/fingertips with circles, and
+    fill the palm as a solid polygon. This follows the real
+    hand shape instead of a rough blob, so there's no ghosting
+    and finger gaps stay correctly excluded.
+    """
+    scale = img_size / float(side)
+
+    # Map each of the 21 landmarks into crop-space, keyed by index
+    pts = {}
+    for idx, (x, y) in enumerate(landmarks_px):
+        pts[idx] = (
+            int((x - crop_x1) * scale),
+            int((y - crop_y1) * scale)
+        )
+
+    mask = np.zeros((img_size, img_size), dtype=np.uint8)
+
+    # Line thickness approximating finger width, scaled to image size
+    thickness = max(int(img_size * 0.09), 10)
+
+    # Draw each finger "bone" as a thick line (follows real hand shape)
+    for (a, b) in mp_hands.HAND_CONNECTIONS:
+        cv2.line(mask, pts[a], pts[b], 255, thickness)
+
+    # Round out joints and fingertips so shape isn't blocky
+    fingertip_ids = {4, 8, 12, 16, 20}
+    for idx, (x, y) in pts.items():
+        radius = int(thickness * 0.6) if idx in fingertip_ids else thickness // 2
+        cv2.circle(mask, (x, y), radius, 255, -1)
+
+    # Fill the palm solidly using wrist + finger-base (MCP) points
+    palm_ids = [0, 1, 5, 9, 13, 17]
+    palm_pts = np.array([pts[i] for i in palm_ids], dtype=np.int32)
+    palm_hull = cv2.convexHull(palm_pts)
+    cv2.fillConvexPoly(mask, palm_hull, 255)
+
+    # Small dilate to merge everything into one clean solid shape
+    kernel = np.ones((5, 5), np.uint8)
+    mask = cv2.dilate(mask, kernel, iterations=1)
+
+    # Light blur ONLY for anti-aliasing — not enough to cause haze
+    mask = cv2.GaussianBlur(mask, (5, 5), 0)
+
+    white_bg = np.full_like(crop, 255)
+    mask_f = (mask.astype(np.float32) / 255.0)[..., None]
+
+    output = (
+        crop.astype(np.float32) * mask_f +
+        white_bg.astype(np.float32) * (1.0 - mask_f)
+    )
+
+    return output.astype(np.uint8)
+
 while True:
 
     success, frame = cap.read()
@@ -54,9 +115,7 @@ while True:
 
         for hand in results.multi_hand_landmarks:
 
-            
             # Draw only for display
-           
             mp_draw.draw_landmarks(
                 frame,
                 hand,
@@ -114,9 +173,7 @@ while True:
                 2
             )
 
-            
             # Square Crop
-           
 
             width = x_max - x_min
             height = y_max - y_min
@@ -145,7 +202,20 @@ while True:
                     (IMG_SIZE, IMG_SIZE)
                 )
 
-                cv2.imshow("Hand Crop", hand_crop)
+                # Build the white-background version (hand untouched)
+                if WHITE_BG:
+                    display_crop = make_white_background(
+                        hand_crop,
+                        list(zip(x_list, y_list)),
+                        new_x_min,
+                        new_y_min,
+                        side,
+                        IMG_SIZE
+                    )
+                else:
+                    display_crop = hand_crop
+
+                cv2.imshow("Hand Crop", display_crop)
 
                 key = cv2.waitKey(1) & 0xFF
 
@@ -156,7 +226,7 @@ while True:
                         f"{count}.jpg"
                     )
 
-                    cv2.imwrite(filename, hand_crop)
+                    cv2.imwrite(filename, display_crop)
 
                     count += 1
 
