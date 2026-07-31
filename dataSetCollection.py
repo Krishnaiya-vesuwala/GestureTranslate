@@ -5,13 +5,12 @@ import os
 
 # Dataset Settings
 
-LABEL = "A"                 # Change for each gesture
-IMG_SIZE = 224              # Final image size
-OFFSET = 40                 # Padding around hand
-WHITE_BG = True             # Set False to keep original background
+LABEL = "0"              # Change for each gesture
+IMG_SIZE = 224               # Final image size
+OFFSET = 40                  # Padding around hand
+WHITE_BG = True               # Set False to keep original background
 
-
-SAVE_PATH = os.path.join("dataset", LABEL)
+SAVE_PATH = os.path.join("dataset/raw", LABEL)
 os.makedirs(SAVE_PATH, exist_ok=True)
 
 count = len(os.listdir(SAVE_PATH))
@@ -30,7 +29,7 @@ mp_draw = mp.solutions.drawing_utils
 
 # Camera
 
-cap = cv2.VideoCapture(0)
+cap = cv2.VideoCapture(1)
 
 print("\n==============================")
 print("Press 'S' to save image")
@@ -38,7 +37,7 @@ print("Press 'Q' to quit")
 print("==============================\n")
 
 
-def make_white_background(crop, landmarks_px, crop_x1, crop_y1, side, img_size):
+def make_white_background(crop, landmarks_px, crop_x1, crop_y1, crop_w, crop_h, img_size):
     """
     Build a white background using MediaPipe's actual hand
     structure: draw the finger 'bones' (HAND_CONNECTIONS) as
@@ -46,21 +45,27 @@ def make_white_background(crop, landmarks_px, crop_x1, crop_y1, side, img_size):
     fill the palm as a solid polygon. This follows the real
     hand shape instead of a rough blob, so there's no ghosting
     and finger gaps stay correctly excluded.
+
+    Uses SEPARATE x/y scale factors based on the actual cropped
+    region size (crop_w, crop_h) rather than assuming a perfect
+    square, so landmarks stay aligned even if the crop was
+    clipped by the frame border before resizing.
     """
-    scale = img_size / float(side)
+    scale_x = img_size / float(crop_w)
+    scale_y = img_size / float(crop_h)
 
     # Map each of the 21 landmarks into crop-space, keyed by index
     pts = {}
     for idx, (x, y) in enumerate(landmarks_px):
         pts[idx] = (
-            int((x - crop_x1) * scale),
-            int((y - crop_y1) * scale)
+            int((x - crop_x1) * scale_x),
+            int((y - crop_y1) * scale_y)
         )
 
     mask = np.zeros((img_size, img_size), dtype=np.uint8)
 
     # Line thickness approximating finger width, scaled to image size
-    thickness = max(int(img_size * 0.09), 10)
+    thickness = max(int(img_size * 0.10), 12)
 
     # Draw each finger "bone" as a thick line (follows real hand shape)
     for (a, b) in mp_hands.HAND_CONNECTIONS:
@@ -69,7 +74,7 @@ def make_white_background(crop, landmarks_px, crop_x1, crop_y1, side, img_size):
     # Round out joints and fingertips so shape isn't blocky
     fingertip_ids = {4, 8, 12, 16, 20}
     for idx, (x, y) in pts.items():
-        radius = int(thickness * 0.6) if idx in fingertip_ids else thickness // 2
+        radius = int(thickness * 0.75) if idx in fingertip_ids else thickness // 2
         cv2.circle(mask, (x, y), radius, 255, -1)
 
     # Fill the palm solidly using wrist + finger-base (MCP) points
@@ -78,9 +83,10 @@ def make_white_background(crop, landmarks_px, crop_x1, crop_y1, side, img_size):
     palm_hull = cv2.convexHull(palm_pts)
     cv2.fillConvexPoly(mask, palm_hull, 255)
 
-    # Small dilate to merge everything into one clean solid shape
-    kernel = np.ones((5, 5), np.uint8)
-    mask = cv2.dilate(mask, kernel, iterations=1)
+    # Dilate to merge everything into one clean solid shape,
+    # and to close any thin dark fringes at fingertips/edges
+    kernel = np.ones((11, 11), np.uint8)
+    mask = cv2.dilate(mask, kernel, iterations=2)
 
     # Light blur ONLY for anti-aliasing — not enough to cause haze
     mask = cv2.GaussianBlur(mask, (5, 5), 0)
@@ -94,6 +100,7 @@ def make_white_background(crop, landmarks_px, crop_x1, crop_y1, side, img_size):
     )
 
     return output.astype(np.uint8)
+
 
 while True:
 
@@ -151,9 +158,13 @@ while True:
             x_max = min(w, x_max)
             y_max = min(h, y_max)
 
-            # Warning if hand is touching border
-            if x_min == 0 or y_min == 0 or x_max == w or y_max == h:
+            # Check BEFORE any clipping-related distortion can occur
+            hand_fully_inside = not (
+                x_min == 0 or y_min == 0 or x_max == w or y_max == h
+            )
 
+            # Warning if hand is touching border
+            if not hand_fully_inside:
                 cv2.putText(
                     frame,
                     "Move Hand Inside Frame",
@@ -197,19 +208,28 @@ while True:
 
             if hand_crop.size != 0:
 
+                # Actual crop size BEFORE resize (may be clipped/non-square
+                # if the hand is near the frame border)
+                actual_crop_h = new_y_max - new_y_min
+                actual_crop_w = new_x_max - new_x_min
+
                 hand_crop = cv2.resize(
                     hand_crop,
                     (IMG_SIZE, IMG_SIZE)
                 )
 
-                # Build the white-background version (hand untouched)
-                if WHITE_BG:
+                # Build the white-background version (hand untouched).
+                # Only do this when the hand is fully inside the frame,
+                # otherwise the crop is distorted and the mask would
+                # misalign (this was the cause of the missing palm).
+                if WHITE_BG and hand_fully_inside:
                     display_crop = make_white_background(
                         hand_crop,
                         list(zip(x_list, y_list)),
                         new_x_min,
                         new_y_min,
-                        side,
+                        actual_crop_w,
+                        actual_crop_h,
                         IMG_SIZE
                     )
                 else:
@@ -221,16 +241,19 @@ while True:
 
                 if key == ord('s'):
 
-                    filename = os.path.join(
-                        SAVE_PATH,
-                        f"{count}.jpg"
-                    )
+                    if not hand_fully_inside:
+                        print("Cannot save - move hand fully inside the frame.")
+                    else:
+                        filename = os.path.join(
+                            SAVE_PATH,
+                            f"{count}.jpg"
+                        )
 
-                    cv2.imwrite(filename, display_crop)
+                        cv2.imwrite(filename, display_crop)
 
-                    count += 1
+                        count += 1
 
-                    print(f"Image {count} saved.")
+                        print(f"Image {count} saved.")
 
                 elif key == ord('q'):
                     cap.release()
