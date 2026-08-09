@@ -16,7 +16,7 @@ NUM_FEATURES = 63
 LABEL_NAMES = {0: "0", 1: "1", 2: "2", 3: "3", 4: "4",
                5: "5", 6: "6", 7: "7", 8: "8", 9: "9"}
 
-CAM_INDEX = 1
+CAM_INDEX = 0
 CONFIDENCE_THRESHOLD = 0.65
 PREDICTION_COOLDOWN = 8
 TEMPERATURE = 1.0   # was 1.5 -- that was artificially flattening confidence

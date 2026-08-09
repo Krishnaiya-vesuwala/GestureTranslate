@@ -33,7 +33,7 @@ LABEL_NAMES = {
 
 RECORD_LEN = 30
 OUTPUT_CSV = "raw_dynamic_signs.csv"
-CAM_INDEX = 1
+CAM_INDEX = 0
 COUNTDOWN_SECONDS = 3
 CLIPS_PER_LABEL_TARGET = 40   # per session -- see README for full protocol
 
