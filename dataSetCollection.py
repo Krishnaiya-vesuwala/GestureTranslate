@@ -1,279 +1,259 @@
+"""
+Dynamic Sign Language Data Collection Script
+ગુજરાતી લેબલ પ્રદર્શન સાથે (with Gujarati label display)
+"""
+
 import cv2
 import mediapipe as mp
 import numpy as np
+import pandas as pd
 import os
+import csv
+import time
+import random
+import uuid
+from PIL import ImageFont, ImageDraw, Image
 
-# Dataset Settings
+# --------------------- CONFIG ---------------------
+# Internal labels (integers) used for CSV storage
+# Display labels shown on screen (Gujarati)
+LABEL_NAMES = {
+    0: "૦", 1: "૧", 2: "૨", 3: "૩", 4: "૪",
+    5: "૫", 6: "૬", 7: "૭", 8: "૮", 9: "૯"
+}
 
-LABEL = "0"              # Change for each gesture
-IMG_SIZE = 224               # Final image size
-OFFSET = 40                  # Padding around hand
-WHITE_BG = True               # Set False to keep original background
+RECORD_LEN             = 30
+OUTPUT_CSV             = "raw_dynamic_signs.csv"
+CAM_INDEX              = 0
+COUNTDOWN_SECONDS      = 3
+CLIPS_PER_LABEL_TARGET = 40
 
-SAVE_PATH = os.path.join("dataset/raw", LABEL)
-os.makedirs(SAVE_PATH, exist_ok=True)
+NUM_LANDMARKS     = 21
+COORDS            = 3
+FEATURES_PER_HAND = NUM_LANDMARKS * COORDS
+TOTAL_FEATURES    = FEATURES_PER_HAND
 
-count = len(os.listdir(SAVE_PATH))
+HEADER = ["clip_id", "frame_number", "label", "session_id"] + \
+         [f"f{i}" for i in range(TOTAL_FEATURES)]
 
-# MediaPipe Initialization
+mp_hands   = mp.solutions.hands
+mp_draw    = mp.solutions.drawing_utils
+SESSION_ID = str(uuid.uuid4())[:8]
 
-mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(
-    static_image_mode=False,
-    max_num_hands=1,
-    min_detection_confidence=0.7,
-    min_tracking_confidence=0.7
-)
+# ── Font setup ──────────────────────────────────────
+FONT_PATH = "NotoSansGujarati-Regular.ttf"
 
-mp_draw = mp.solutions.drawing_utils
+def load_font(size):
+    if os.path.exists(FONT_PATH):
+        return ImageFont.truetype(FONT_PATH, size)
+    print(f"WARNING: '{FONT_PATH}' not found! Gujarati may not render.")
+    return ImageFont.load_default()
 
-# Camera
-
-cap = cv2.VideoCapture(1)
-
-print("\n==============================")
-print("Press 'S' to save image")
-print("Press 'Q' to quit")
-print("==============================\n")
+font_medium = load_font(28)
+font_small  = load_font(22)
 
 
-def make_white_background(crop, landmarks_px, crop_x1, crop_y1, crop_w, crop_h, img_size):
-    """
-    Build a white background using MediaPipe's actual hand
-    structure: draw the finger 'bones' (HAND_CONNECTIONS) as
-    thick lines, round the joints/fingertips with circles, and
-    fill the palm as a solid polygon. This follows the real
-    hand shape instead of a rough blob, so there's no ghosting
-    and finger gaps stay correctly excluded.
+def put_gujarati_text(frame, text, pos, font,
+                      color=(255, 255, 255), bg_color=None):
+    """Render Unicode/Gujarati text on OpenCV frame via PIL."""
+    img_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    draw    = ImageDraw.Draw(img_pil)
+    x, y   = pos
+    if bg_color is not None:
+        bbox = draw.textbbox((x, y), text, font=font)
+        draw.rectangle(
+            [bbox[0]-4, bbox[1]-4, bbox[2]+4, bbox[3]+4],
+            fill=bg_color
+        )
+    draw.text((x, y), text, font=font, fill=color)
+    frame[:] = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
-    Uses SEPARATE x/y scale factors based on the actual cropped
-    region size (crop_w, crop_h) rather than assuming a perfect
-    square, so landmarks stay aligned even if the crop was
-    clipped by the frame border before resizing.
-    """
-    scale_x = img_size / float(crop_w)
-    scale_y = img_size / float(crop_h)
 
-    # Map each of the 21 landmarks into crop-space, keyed by index
-    pts = {}
-    for idx, (x, y) in enumerate(landmarks_px):
-        pts[idx] = (
-            int((x - crop_x1) * scale_x),
-            int((y - crop_y1) * scale_y)
+def ensure_header(csv_path):
+    if not os.path.exists(csv_path):
+        with open(csv_path, "w", newline="") as f:
+            f.write(",".join(HEADER) + "\n")
+        return
+    with open(csv_path, "r") as f:
+        first_line = f.readline().strip()
+    if first_line != ",".join(HEADER):
+        raise ValueError(f"Header mismatch in {csv_path}!")
+
+
+def extract_landmarks(results):
+    features = np.zeros(FEATURES_PER_HAND)
+    if results.multi_hand_landmarks:
+        hand_landmarks = results.multi_hand_landmarks[0]
+        coords = []
+        for lm in hand_landmarks.landmark:
+            coords.extend([lm.x, lm.y, lm.z])
+        features = np.array(coords)
+    return features
+
+
+def save_clip_to_csv(rows, csv_path):
+    if not rows:
+        return
+    ensure_header(csv_path)
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=HEADER)
+        for row in rows:
+            writer.writerow(row)
+    print(f"  -> Saved {len(rows)} rows to {csv_path}")
+
+
+def main():
+    cap = cv2.VideoCapture(CAM_INDEX)
+    hands = mp_hands.Hands(
+        static_image_mode=False,
+        max_num_hands=1,
+        min_detection_confidence=0.6,
+        min_tracking_confidence=0.6,
+    )
+
+    current_label    = None
+    recording        = False
+    countdown_active = False
+    countdown_start  = None
+    frame_buffer     = []
+    clip_id          = 0
+    clips_this_session = {k: 0 for k in LABEL_NAMES}
+
+    if os.path.exists(OUTPUT_CSV):
+        try:
+            existing = pd.read_csv(OUTPUT_CSV)
+            if len(existing) > 0:
+                clip_id = int(existing["clip_id"].max()) + 1
+        except Exception:
+            pass
+
+    order = list(LABEL_NAMES.keys())
+    random.shuffle(order)
+
+    print(f"\nSession ID: {SESSION_ID}")
+    print("રેકોર્ડિંગ ક્રમ (Recording order):", order)
+    print("\nનિયંત્રણો (Controls):")
+    print("  0-9 → લેબલ પસંદ કરો (Select label)")
+    print("  r   → રેકોર્ડિંગ શરૂ કરો (Start recording)")
+    print("  q   → બહાર નીકળો (Quit)\n")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame   = cv2.flip(frame, 1)
+        rgb     = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = hands.process(rgb)
+
+        if results.multi_hand_landmarks:
+            for hlm in results.multi_hand_landmarks:
+                mp_draw.draw_landmarks(frame, hlm, mp_hands.HAND_CONNECTIONS)
+
+        # Gujarati label display
+        label_text   = LABEL_NAMES.get(current_label, "કોઈ નહીં")  # "None"
+        clips_so_far = clips_this_session.get(current_label, 0)
+
+        put_gujarati_text(
+            frame,
+            text     = f"લેબલ: {label_text}  (ક્લિપ્સ: {clips_so_far}/{CLIPS_PER_LABEL_TARGET})",
+            pos      = (10, 8),
+            font     = font_medium,
+            color    = (0, 255, 0),
+            bg_color = (0, 0, 0)
         )
 
-    mask = np.zeros((img_size, img_size), dtype=np.uint8)
-
-    # Line thickness approximating finger width, scaled to image size
-    thickness = max(int(img_size * 0.10), 12)
-
-    # Draw each finger "bone" as a thick line (follows real hand shape)
-    for (a, b) in mp_hands.HAND_CONNECTIONS:
-        cv2.line(mask, pts[a], pts[b], 255, thickness)
-
-    # Round out joints and fingertips so shape isn't blocky
-    fingertip_ids = {4, 8, 12, 16, 20}
-    for idx, (x, y) in pts.items():
-        radius = int(thickness * 0.75) if idx in fingertip_ids else thickness // 2
-        cv2.circle(mask, (x, y), radius, 255, -1)
-
-    # Fill the palm solidly using wrist + finger-base (MCP) points
-    palm_ids = [0, 1, 5, 9, 13, 17]
-    palm_pts = np.array([pts[i] for i in palm_ids], dtype=np.int32)
-    palm_hull = cv2.convexHull(palm_pts)
-    cv2.fillConvexPoly(mask, palm_hull, 255)
-
-    # Dilate to merge everything into one clean solid shape,
-    # and to close any thin dark fringes at fingertips/edges
-    kernel = np.ones((11, 11), np.uint8)
-    mask = cv2.dilate(mask, kernel, iterations=2)
-
-    # Light blur ONLY for anti-aliasing — not enough to cause haze
-    mask = cv2.GaussianBlur(mask, (5, 5), 0)
-
-    white_bg = np.full_like(crop, 255)
-    mask_f = (mask.astype(np.float32) / 255.0)[..., None]
-
-    output = (
-        crop.astype(np.float32) * mask_f +
-        white_bg.astype(np.float32) * (1.0 - mask_f)
-    )
-
-    return output.astype(np.uint8)
-
-
-while True:
-
-    success, frame = cap.read()
-
-    if not success:
-        break
-
-    frame = cv2.flip(frame, 1)
-
-    # Copy of original frame (NO drawings)
-    clean_frame = frame.copy()
-
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-    results = hands.process(rgb)
-
-    if results.multi_hand_landmarks:
-
-        for hand in results.multi_hand_landmarks:
-
-            # Draw only for display
-            mp_draw.draw_landmarks(
-                frame,
-                hand,
-                mp_hands.HAND_CONNECTIONS
-            )
-
-            h, w, _ = frame.shape
-
-            x_list = []
-            y_list = []
-
-            for lm in hand.landmark:
-                x = int(lm.x * w)
-                y = int(lm.y * h)
-
-                x_list.append(x)
-                y_list.append(y)
-
-            x_min = min(x_list)
-            x_max = max(x_list)
-            y_min = min(y_list)
-            y_max = max(y_list)
-
-            # Add padding
-            x_min -= OFFSET
-            y_min -= OFFSET
-            x_max += OFFSET
-            y_max += OFFSET
-
-            # Keep inside image
-            x_min = max(0, x_min)
-            y_min = max(0, y_min)
-            x_max = min(w, x_max)
-            y_max = min(h, y_max)
-
-            # Check BEFORE any clipping-related distortion can occur
-            hand_fully_inside = not (
-                x_min == 0 or y_min == 0 or x_max == w or y_max == h
-            )
-
-            # Warning if hand is touching border
-            if not hand_fully_inside:
-                cv2.putText(
+        # Countdown
+        if countdown_active:
+            elapsed   = time.time() - countdown_start
+            remaining = COUNTDOWN_SECONDS - elapsed
+            if remaining > 0:
+                put_gujarati_text(
                     frame,
-                    "Move Hand Inside Frame",
-                    (20, 80),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    (0, 0, 255),
-                    2
+                    text     = f"તૈયાર રહો: {int(remaining) + 1}",  # "Get ready"
+                    pos      = (10, 90),
+                    font     = font_medium,
+                    color    = (0, 165, 255),
+                    bg_color = (0, 0, 0)
                 )
+            else:
+                countdown_active = False
+                recording        = True
+                frame_buffer     = []
+                print(f"  રેકોર્ડિંગ શરૂ: લેબલ {current_label} ({label_text})")
 
-            # Draw Bounding Box (Preview Only)
-            cv2.rectangle(
+        # Recording
+        if recording:
+            feats = extract_landmarks(results)
+            frame_buffer.append(feats)
+
+            put_gujarati_text(
                 frame,
-                (x_min, y_min),
-                (x_max, y_max),
-                (0, 255, 0),
-                2
+                text     = f"રેક {len(frame_buffer)}/{RECORD_LEN}",
+                pos      = (10, 50),
+                font     = font_medium,
+                color    = (0, 0, 255),
+                bg_color = (0, 0, 0)
             )
 
-            # Square Crop
-
-            width = x_max - x_min
-            height = y_max - y_min
-
-            side = max(width, height)
-
-            center_x = (x_min + x_max) // 2
-            center_y = (y_min + y_max) // 2
-
-            new_x_min = max(0, center_x - side // 2)
-            new_y_min = max(0, center_y - side // 2)
-
-            new_x_max = min(w, new_x_min + side)
-            new_y_max = min(h, new_y_min + side)
-
-            # Crop from CLEAN frame
-            hand_crop = clean_frame[
-                new_y_min:new_y_max,
-                new_x_min:new_x_max
-            ]
-
-            if hand_crop.size != 0:
-
-                # Actual crop size BEFORE resize (may be clipped/non-square
-                # if the hand is near the frame border)
-                actual_crop_h = new_y_max - new_y_min
-                actual_crop_w = new_x_max - new_x_min
-
-                hand_crop = cv2.resize(
-                    hand_crop,
-                    (IMG_SIZE, IMG_SIZE)
-                )
-
-                # Build the white-background version (hand untouched).
-                # Only do this when the hand is fully inside the frame,
-                # otherwise the crop is distorted and the mask would
-                # misalign (this was the cause of the missing palm).
-                if WHITE_BG and hand_fully_inside:
-                    display_crop = make_white_background(
-                        hand_crop,
-                        list(zip(x_list, y_list)),
-                        new_x_min,
-                        new_y_min,
-                        actual_crop_w,
-                        actual_crop_h,
-                        IMG_SIZE
+            if len(frame_buffer) >= RECORD_LEN:
+                clip_rows = []
+                for i, f_feats in enumerate(frame_buffer):
+                    row = {
+                        "clip_id":      clip_id,
+                        "frame_number": i,
+                        "label":        current_label,
+                        "session_id":   SESSION_ID,
+                    }
+                    row.update(
+                        {f"f{j}": float(f_feats[j])
+                         for j in range(TOTAL_FEATURES)}
                     )
-                else:
-                    display_crop = hand_crop
+                    clip_rows.append(row)
 
-                cv2.imshow("Hand Crop", display_crop)
+                save_clip_to_csv(clip_rows, OUTPUT_CSV)
+                print(f"  Saved clip_id={clip_id} | Label: {label_text}")
 
-                key = cv2.waitKey(1) & 0xFF
+                clips_this_session[current_label] = \
+                    clips_this_session.get(current_label, 0) + 1
+                clip_id     += 1
+                frame_buffer = []
+                recording    = False
 
-                if key == ord('s'):
+        # Controls hint
+        put_gujarati_text(
+            frame,
+            text  = "0-9=લેબલ | r=રેક | q=બહાર",
+            pos   = (5, frame.shape[0] - 30),
+            font  = font_small,
+            color = (150, 150, 150)
+        )
 
-                    if not hand_fully_inside:
-                        print("Cannot save - move hand fully inside the frame.")
-                    else:
-                        filename = os.path.join(
-                            SAVE_PATH,
-                            f"{count}.jpg"
-                        )
+        cv2.imshow("ગુજરાતી સાંકેતિક ભાષા ડેટા સંગ્રહ", frame)
+        key = cv2.waitKey(1) & 0xFF
 
-                        cv2.imwrite(filename, display_crop)
+        if key in [ord(str(d)) for d in range(10)]:
+            current_label = int(chr(key))
+            print(f"  લેબલ: {current_label} ({LABEL_NAMES.get(current_label)})")
 
-                        count += 1
+        elif key == ord('r'):
+            if current_label is None:
+                print("ચેતવણી: પહેલા લેબલ પસંદ કરો!")
+            elif not recording and not countdown_active:
+                countdown_active = True
+                countdown_start  = time.time()
 
-                        print(f"Image {count} saved.")
+        elif key == ord('q'):
+            break
 
-                elif key == ord('q'):
-                    cap.release()
-                    cv2.destroyAllWindows()
-                    exit()
+    cap.release()
+    cv2.destroyAllWindows()
 
-    cv2.putText(
-        frame,
-        f"Images : {count}",
-        (20, 40),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1,
-        (255, 0, 0),
-        2
-    )
+    print("\nસત્ર સારાંશ (Session Summary):")
+    for lbl, count in clips_this_session.items():
+        print(f"  {LABEL_NAMES.get(lbl,'?')} ({lbl}): {count} clips")
+    print(f"\nડેટા સાચવ્યો: {OUTPUT_CSV}")
 
-    cv2.imshow("Dataset Collector", frame)
 
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
-
-cap.release()
-cv2.destroyAllWindows()
+if __name__ == "__main__":
+    main()
